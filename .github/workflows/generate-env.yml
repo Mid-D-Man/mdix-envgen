@@ -4,21 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: 'Target environment (dev/staging/prod/all)'
-        required: false
-        default: 'all'
+        description: 'Target environment: dev | staging | prod'
+        required: true
+        default: 'dev'
       dry_run:
         description: 'Preview without writing files (true/false)'
         required: false
         default: 'false'
-      decrypt:
-        description: 'Decrypt secrets from .mdix.enc (true/false)'
-        required: false
-        default: 'false'
   push:
     paths:
-      - 'templates/**'
-      - '!templates/**.env'
+      - 'templates/env.master.mdix'
 
 jobs:
   generate:
@@ -59,148 +54,226 @@ jobs:
           sudo cp ~/.mdix-bin/mdix /usr/local/bin/mdix
           echo "mdix version: $(mdix --version)"
 
-      - name: Validate all templates
-        run: |
-          for f in templates/*.mdix; do
-            echo "Validating: $f"
-            mdix validate "$f"
-          done
+      - name: Validate master template
+        run: mdix validate templates/env.master.mdix
 
-      - name: Generate .env files
+      - name: Patch environment switch and compile
         env:
-          TARGET_ENV:     ${{ inputs.environment || 'all' }}
-          DRY_RUN:        ${{ inputs.dry_run || 'false' }}
-          DECRYPT_SECRETS: ${{ inputs.decrypt || 'false' }}
-          MDIX_DLM_PASSWORD: ${{ secrets.MDIX_ENV_PASSWORD }}
+          TARGET_ENV: ${{ inputs.environment || 'dev' }}
+          DRY_RUN:    ${{ inputs.dry_run || 'false' }}
         run: |
           python3 << 'PYEOF'
-          import json, os, re, sys
-          from datetime import datetime, timezone
+          import os, subprocess, re, json, sys
 
+          target_env = os.environ.get("TARGET_ENV", "dev").lower()
           dry_run    = os.environ.get("DRY_RUN", "false").lower() == "true"
-          target_env = os.environ.get("TARGET_ENV", "all").lower()
-          decrypt    = os.environ.get("DECRYPT_SECRETS", "false").lower() == "true"
 
-          if dry_run:
-              print("=" * 56)
-              print("  DRY RUN — no .env files will be written")
-              print("=" * 56)
-              print()
+          # Map input string to enum value
+          env_map = { "dev": "Env.DEV", "staging": "Env.STAGING", "prod": "Env.PROD" }
+          if target_env not in env_map:
+              print(f"Unknown environment '{target_env}' — must be dev, staging, or prod")
+              sys.exit(1)
 
-          def mdix_to_env(template_path: str, output_path: str):
-              """Convert a .mdix template to a .env file via mdix convert."""
-              import subprocess, tempfile
+          enum_value = env_map[target_env]
+          print(f"Target environment : {target_env}")
+          print(f"Enum value         : {enum_value}")
+          print(f"Dry run            : {dry_run}")
+          print()
 
-              # Convert .mdix → JSON first, then transform JSON → .env
-              with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
-                  tmp_json = tf.name
+          # Read the master template
+          with open("templates/env.master.mdix") as fh:
+              source = fh.read()
 
-              try:
-                  result = subprocess.run(
-                      ["mdix", "convert", template_path, "--to", "json", "-o", tmp_json],
-                      capture_output=True, text=True
-                  )
-                  if result.returncode != 0:
-                      print(f"  ERROR converting {template_path}: {result.stderr}")
-                      return False
+          # Patch the current_env line
+          # Matches:  current_env<enum> = Env.DEV  (any existing value)
+          patched = re.sub(
+              r'(current_env<enum>\s*=\s*)Env\.\w+',
+              rf'\g<1>{enum_value}',
+              source
+          )
 
-                  with open(tmp_json) as fh:
-                      data = json.load(fh)
+          if patched == source:
+              print("WARNING: could not find 'current_env<enum>' line to patch")
+              sys.exit(1)
 
-                  lines = [
-                      f"# Generated from {os.path.basename(template_path)}",
-                      f"# {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
-                      f"# DO NOT EDIT — edit the .mdix template instead",
-                      "",
-                  ]
+          print(f"Patched: current_env<enum> = {enum_value}")
 
-                  for key, value in sorted(data.items()):
-                      # Skip metadata keys
-                      if key in ("environment", "project", "generated_by"):
-                          continue
-                      # Skip nested objects/arrays — they don't map to .env
-                      if isinstance(value, (dict, list)):
-                          continue
-                      # Format value
-                      if isinstance(value, bool):
-                          env_val = "true" if value else "false"
-                      elif isinstance(value, str) and " " in value:
-                          env_val = f'"{value}"'
-                      else:
-                          env_val = str(value)
+          # Write patched version to a temp file
+          patched_path = f"/tmp/env.{target_env}.mdix"
+          with open(patched_path, "w") as fh:
+              fh.write(patched)
 
-                      lines.append(f"{key.upper()}={env_val}")
+          # Convert patched .mdix → JSON
+          json_path = f"/tmp/env.{target_env}.json"
+          result = subprocess.run(
+              ["mdix", "convert", patched_path, "--to", "json", "-o", json_path],
+              capture_output=True, text=True
+          )
+          if result.returncode != 0:
+              print(f"ERROR: mdix convert failed:\n{result.stderr}")
+              sys.exit(1)
 
-                  if not dry_run:
-                      os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-                      with open(output_path, "w") as fh:
-                          fh.write("\n".join(lines) + "\n")
-                  return True
-
-              finally:
-                  try: os.unlink(tmp_json)
-                  except: pass
-
-          # Find all .mdix templates
-          templates_dir = "templates"
-          if not os.path.isdir(templates_dir):
-              print("No templates/ directory found.")
-              sys.exit(0)
-
-          generated = []
-          skipped   = []
-
-          for filename in sorted(os.listdir(templates_dir)):
-              if not filename.endswith(".mdix"):
-                  continue
-
-              # Derive environment name from filename
-              # e.g. env.dev.mdix → dev, env.prod.mdix → prod, env.mdix → all
-              parts = filename.replace(".mdix", "").split(".")
-              env_name = parts[-1] if len(parts) > 1 else "default"
-
-              if target_env != "all" and env_name != target_env:
-                  skipped.append(filename)
-                  print(f"  ---  {filename}  (skipped — target is {target_env})")
-                  continue
-
-              template_path = os.path.join(templates_dir, filename)
-              output_path   = os.path.join(
-                  "output",
-                  f".env.{env_name}" if env_name != "default" else ".env"
-              )
-
-              print(f"  GEN  {template_path} → {output_path}")
-              ok = mdix_to_env(template_path, output_path)
-              if ok:
-                  generated.append(output_path)
-              else:
-                  print(f"  ERR  Failed to generate {output_path}")
+          with open(json_path) as fh:
+              data = json.load(fh)
 
           print()
-          print("=" * 56)
-          print(f"  generated : {len(generated)}")
-          print(f"  skipped   : {len(skipped)}")
+          print("Resolved keys:")
+          for k, v in sorted(data.items()):
+              print(f"  {k} = {str(v)[:60]}")
+
+          # Write resolved JSON for the merge step
+          with open(f"/tmp/resolved.{target_env}.json", "w") as fh:
+              json.dump(data, fh, indent=2)
+
+          print()
+          print("Compile step complete.")
+          PYEOF
+
+      - name: Decrypt secrets (if enc file exists)
+        env:
+          TARGET_ENV:          ${{ inputs.environment || 'dev' }}
+          MDIX_DLM_PASSWORD:   ${{ secrets.MDIX_ENV_PASSWORD }}
+        run: |
+          if [ -f "templates/env.secrets.mdix.enc" ]; then
+            echo "Decrypting secrets..."
+            mdix decrypt templates/env.secrets.mdix.enc \
+              --password "$MDIX_DLM_PASSWORD" \
+              -o /tmp/secrets_out/
+
+            mdix convert /tmp/secrets_out/env.secrets.mdix \
+              --to json -o /tmp/secrets.json
+
+            echo "Secrets decrypted and converted."
+          else
+            echo "No env.secrets.mdix.enc found — skipping secrets merge."
+            echo "{}" > /tmp/secrets.json
+          fi
+
+      - name: Generate .env file
+        env:
+          TARGET_ENV: ${{ inputs.environment || 'dev' }}
+          DRY_RUN:    ${{ inputs.dry_run || 'false' }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, sys
+          from datetime import datetime, timezone
+
+          target_env = os.environ.get("TARGET_ENV", "dev").lower()
+          dry_run    = os.environ.get("DRY_RUN", "false").lower() == "true"
+
+          # Load the resolved config from the compile step
+          with open(f"/tmp/resolved.{target_env}.json") as fh:
+              config = json.load(fh)
+
+          # Load secrets (empty dict if no secrets file)
+          with open("/tmp/secrets.json") as fh:
+              secrets = json.load(fh)
+
+          # ── Merge secrets into config ─────────────────────────────────────
+          # Secrets file has keys like:
+          #   database.password_dev, auth.jwt_secret_prod, etc.
+          # We pick the right one based on target_env and inject it
+          # over the INJECT_FROM_SECRETS placeholder values.
+
+          PLACEHOLDER = "INJECT_FROM_SECRETS"
+
+          def resolve_secret(secrets: dict, group: str, field: str, env: str) -> str | None:
+              """Look for secrets.group.field_env first, then secrets.group.field"""
+              keyed   = secrets.get(f"{group}.{field}_{env}")
+              generic = secrets.get(f"{group}.{field}")
+              return keyed if keyed is not None else generic
+
+          injections = {
+              "database.password": resolve_secret(secrets, "database", "password", target_env),
+              "redis.password":    resolve_secret(secrets, "redis",    "password", target_env),
+              "auth.jwt_secret":   resolve_secret(secrets, "auth",     "jwt_secret", target_env),
+              "services.stripe_key": resolve_secret(secrets, "services", "stripe_key", target_env)
+                                  or resolve_secret(secrets, "services", "stripe_key_dev", ""),
+              "services.sendgrid_key": resolve_secret(secrets, "services", "sendgrid_key", target_env),
+              "services.sentry_dsn":   resolve_secret(secrets, "services", "sentry_dsn",   target_env),
+          }
+
+          # Apply injections
+          for dotted_key, secret_value in injections.items():
+              if secret_value and config.get(dotted_key) == PLACEHOLDER:
+                  config[dotted_key] = secret_value
+
+          # ── Build .env lines ─────────────────────────────────────────────
+          # Table key + property → TABLE_PROPERTY=value
+          # Flat key            → KEY=value
+          # Skip metadata keys and enum markers
+
+          SKIP_KEYS = {"current_env", "environment", "generated_by", "project"}
+
+          def format_env_value(v) -> str:
+              if isinstance(v, bool):
+                  return "true" if v else "false"
+              if isinstance(v, str) and (" " in v or "=" in v or "#" in v):
+                  return f'"{v}"'
+              if isinstance(v, dict) or isinstance(v, list):
+                  return None  # skip nested — already flattened by mdix convert
+              return str(v)
+
+          lines = [
+              f"# Generated by mdix-envgen",
+              f"# Environment  : {target_env.upper()}",
+              f"# Generated at : {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
+              f"# Source       : templates/env.master.mdix",
+              f"# DO NOT EDIT  — edit the .mdix template instead",
+              "",
+          ]
+
+          last_prefix = None
+          for raw_key in sorted(config.keys()):
+              if raw_key in SKIP_KEYS:
+                  continue
+              value = config[raw_key]
+              formatted = format_env_value(value)
+              if formatted is None:
+                  continue
+
+              # Derive env var name:  "database.host" → "DATABASE_HOST"
+              env_key = raw_key.replace(".", "_").upper()
+
+              # Add blank line between table groups
+              prefix = raw_key.split(".")[0] if "." in raw_key else "_flat"
+              if last_prefix is not None and prefix != last_prefix:
+                  lines.append("")
+              last_prefix = prefix
+
+              lines.append(f"{env_key}={formatted}")
+
+          output = "\n".join(lines) + "\n"
+
+          # ── Print preview ──────────────────────────────────────────────────
+          print(f"=== Preview: output/.env.{target_env} ===")
+          print()
+          print(output)
           print("=" * 56)
 
           if dry_run:
-              print()
-              print("DRY RUN — re-run with dry_run=false to write files.")
+              print("DRY RUN — file not written.")
+          else:
+              os.makedirs("output", exist_ok=True)
+              out_path = f"output/.env.{target_env}"
+              with open(out_path, "w") as fh:
+                  fh.write(output)
+              print(f"Written: {out_path}")
           PYEOF
 
-      - name: Show generated files
+      - name: Show output
         if: ${{ inputs.dry_run != 'true' }}
         run: |
-          echo "=== Generated output/ ==="
-          find output/ -name ".env*" 2>/dev/null | sort || echo "(none yet)"
+          echo "=== output/ directory ==="
+          ls -la output/ 2>/dev/null || echo "(empty)"
 
       - name: Commit generated .env files
         if: ${{ inputs.dry_run != 'true' }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add output/ 2>/dev/null || true
+          git add output/
           git diff --staged --quiet \
-            && echo "Nothing new to commit." \
-            || git commit -m "chore: regenerate .env files from templates [skip ci]"
+            && echo "Nothing changed." \
+            || git commit -m "chore: regenerate .env.${{ inputs.environment || 'dev' }} [skip ci]"
           git push
