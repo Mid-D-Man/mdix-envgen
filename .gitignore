@@ -1,0 +1,12 @@
+# Real secrets — NEVER commit
+templates/env.secrets.mdix
+*.mdix.key
+
+# Generated .env files — commit output/ but not root-level .env
+.env
+.env.local
+
+# Tooling
+target/
+node_modules/
+.wrangler/
