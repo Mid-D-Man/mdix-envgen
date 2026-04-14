@@ -1,0 +1,206 @@
+name: Generate .env files
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment (dev/staging/prod/all)'
+        required: false
+        default: 'all'
+      dry_run:
+        description: 'Preview without writing files (true/false)'
+        required: false
+        default: 'false'
+      decrypt:
+        description: 'Decrypt secrets from .mdix.enc (true/false)'
+        required: false
+        default: 'false'
+  push:
+    paths:
+      - 'templates/**'
+      - '!templates/**.env'
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Get weekly cache key
+        id: week
+        run: echo "key=$(date -u '+%Y-%U')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache mdix CLI binary
+        id: cache-mdix
+        uses: actions/cache@v4
+        with:
+          path: ~/.mdix-bin
+          key: mdix-cli-${{ runner.os }}-${{ steps.week.outputs.key }}
+          restore-keys: mdix-cli-${{ runner.os }}-
+
+      - name: Build mdix CLI (cache miss only)
+        if: steps.cache-mdix.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/Mid-D-Man/DixScript-Rust.git /tmp/dixscript
+          cd /tmp/dixscript
+          cargo build -p mdix-cli --release
+          mkdir -p ~/.mdix-bin
+          cp target/release/mdix ~/.mdix-bin/mdix
+
+      - name: Install mdix to PATH
+        run: |
+          sudo cp ~/.mdix-bin/mdix /usr/local/bin/mdix
+          echo "mdix version: $(mdix --version)"
+
+      - name: Validate all templates
+        run: |
+          for f in templates/*.mdix; do
+            echo "Validating: $f"
+            mdix validate "$f"
+          done
+
+      - name: Generate .env files
+        env:
+          TARGET_ENV:     ${{ inputs.environment || 'all' }}
+          DRY_RUN:        ${{ inputs.dry_run || 'false' }}
+          DECRYPT_SECRETS: ${{ inputs.decrypt || 'false' }}
+          MDIX_DLM_PASSWORD: ${{ secrets.MDIX_ENV_PASSWORD }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, re, sys
+          from datetime import datetime, timezone
+
+          dry_run    = os.environ.get("DRY_RUN", "false").lower() == "true"
+          target_env = os.environ.get("TARGET_ENV", "all").lower()
+          decrypt    = os.environ.get("DECRYPT_SECRETS", "false").lower() == "true"
+
+          if dry_run:
+              print("=" * 56)
+              print("  DRY RUN — no .env files will be written")
+              print("=" * 56)
+              print()
+
+          def mdix_to_env(template_path: str, output_path: str):
+              """Convert a .mdix template to a .env file via mdix convert."""
+              import subprocess, tempfile
+
+              # Convert .mdix → JSON first, then transform JSON → .env
+              with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
+                  tmp_json = tf.name
+
+              try:
+                  result = subprocess.run(
+                      ["mdix", "convert", template_path, "--to", "json", "-o", tmp_json],
+                      capture_output=True, text=True
+                  )
+                  if result.returncode != 0:
+                      print(f"  ERROR converting {template_path}: {result.stderr}")
+                      return False
+
+                  with open(tmp_json) as fh:
+                      data = json.load(fh)
+
+                  lines = [
+                      f"# Generated from {os.path.basename(template_path)}",
+                      f"# {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
+                      f"# DO NOT EDIT — edit the .mdix template instead",
+                      "",
+                  ]
+
+                  for key, value in sorted(data.items()):
+                      # Skip metadata keys
+                      if key in ("environment", "project", "generated_by"):
+                          continue
+                      # Skip nested objects/arrays — they don't map to .env
+                      if isinstance(value, (dict, list)):
+                          continue
+                      # Format value
+                      if isinstance(value, bool):
+                          env_val = "true" if value else "false"
+                      elif isinstance(value, str) and " " in value:
+                          env_val = f'"{value}"'
+                      else:
+                          env_val = str(value)
+
+                      lines.append(f"{key.upper()}={env_val}")
+
+                  if not dry_run:
+                      os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+                      with open(output_path, "w") as fh:
+                          fh.write("\n".join(lines) + "\n")
+                  return True
+
+              finally:
+                  try: os.unlink(tmp_json)
+                  except: pass
+
+          # Find all .mdix templates
+          templates_dir = "templates"
+          if not os.path.isdir(templates_dir):
+              print("No templates/ directory found.")
+              sys.exit(0)
+
+          generated = []
+          skipped   = []
+
+          for filename in sorted(os.listdir(templates_dir)):
+              if not filename.endswith(".mdix"):
+                  continue
+
+              # Derive environment name from filename
+              # e.g. env.dev.mdix → dev, env.prod.mdix → prod, env.mdix → all
+              parts = filename.replace(".mdix", "").split(".")
+              env_name = parts[-1] if len(parts) > 1 else "default"
+
+              if target_env != "all" and env_name != target_env:
+                  skipped.append(filename)
+                  print(f"  ---  {filename}  (skipped — target is {target_env})")
+                  continue
+
+              template_path = os.path.join(templates_dir, filename)
+              output_path   = os.path.join(
+                  "output",
+                  f".env.{env_name}" if env_name != "default" else ".env"
+              )
+
+              print(f"  GEN  {template_path} → {output_path}")
+              ok = mdix_to_env(template_path, output_path)
+              if ok:
+                  generated.append(output_path)
+              else:
+                  print(f"  ERR  Failed to generate {output_path}")
+
+          print()
+          print("=" * 56)
+          print(f"  generated : {len(generated)}")
+          print(f"  skipped   : {len(skipped)}")
+          print("=" * 56)
+
+          if dry_run:
+              print()
+              print("DRY RUN — re-run with dry_run=false to write files.")
+          PYEOF
+
+      - name: Show generated files
+        if: ${{ inputs.dry_run != 'true' }}
+        run: |
+          echo "=== Generated output/ ==="
+          find output/ -name ".env*" 2>/dev/null | sort || echo "(none yet)"
+
+      - name: Commit generated .env files
+        if: ${{ inputs.dry_run != 'true' }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/ 2>/dev/null || true
+          git diff --staged --quiet \
+            && echo "Nothing new to commit." \
+            || git commit -m "chore: regenerate .env files from templates [skip ci]"
+          git push
