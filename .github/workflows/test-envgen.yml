@@ -1,0 +1,538 @@
+# .github/workflows/test-envgen.yml
+#
+# Tests the full envgen pipeline against env.master.mdix.
+#
+# Two jobs:
+#   1. test           — always runs; uses a hardcoded test secrets JSON.
+#                       Validates keys, env-specific values, and secret injection.
+#                       Also verifies dry-run mode produces no files.
+#   2. test-encrypted — only on workflow_dispatch; tests the FULL
+#                       encrypt → commit → decrypt → generate chain.
+#                       Requires MDIX_ENV_TEST_PASSWORD repository secret.
+#
+# Usage:
+#   Automatic: triggers on changes to env.master.mdix or generate_env.py
+#   Manual:    Actions → Test envgen pipeline → Run workflow
+
+name: Test envgen pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_encrypted_test:
+        description: 'Also test the full encrypt/decrypt pipeline (requires MDIX_ENV_TEST_PASSWORD secret)'
+        required: false
+        default: 'true'
+  push:
+    paths:
+      - '.mdix/env/templates/env.master.mdix'
+      - 'scripts/generate_env.py'
+  schedule:
+    # Weekly smoke test — Mondays 08:00 UTC
+    - cron: '0 8 * * 1'
+
+env:
+  MASTER_TEMPLATE: .mdix/env/templates/env.master.mdix
+
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+# ─────────────────────────────────────────────────────────────────────────────
+
+  # ── Job 1: Core pipeline test (always runs) ─────────────────────────────────
+  test:
+    name: Core envgen test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      # ── Setup ──────────────────────────────────────────────────────────────
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Weekly cache key
+        id: week
+        run: echo "key=$(date -u '+%Y-%U')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache mdix binary
+        id: cache-mdix
+        uses: actions/cache@v4
+        with:
+          path: ~/.mdix-bin
+          key: mdix-cli-${{ runner.os }}-${{ steps.week.outputs.key }}
+          restore-keys: mdix-cli-${{ runner.os }}-
+
+      - name: Build mdix (cache miss only)
+        if: steps.cache-mdix.outputs.cache-hit != 'true'
+        run: |
+          echo "Cache miss — building mdix from source..."
+          git clone --depth 1 https://github.com/Mid-D-Man/DixScript-Rust.git /tmp/dixscript
+          cd /tmp/dixscript
+          cargo build -p mdix-cli --release
+          mkdir -p ~/.mdix-bin
+          cp target/release/mdix ~/.mdix-bin/mdix
+          echo "Build complete."
+
+      - name: Install mdix to PATH
+        run: |
+          sudo cp ~/.mdix-bin/mdix /usr/local/bin/mdix
+          echo "mdix $(mdix --version)"
+
+      # ── Template validation ─────────────────────────────────────────────────
+
+      - name: Validate master template
+        run: |
+          echo "=== Validating $MASTER_TEMPLATE ==="
+          mdix validate "$MASTER_TEMPLATE"
+          echo "✓ Template is valid."
+
+      - name: Inspect master template
+        run: |
+          echo ""
+          echo "=== Template structure ==="
+          mdix inspect "$MASTER_TEMPLATE" --sections
+          echo ""
+          echo "=== Resolved keys (default Env.DEV) ==="
+          mdix convert "$MASTER_TEMPLATE" --to json -o /tmp/master_inspect.json
+          python3 - << 'PY'
+          import json
+          d = json.load(open('/tmp/master_inspect.json'))
+          for k in sorted(d.keys()):
+              print(f"  {k} = {str(d[k])[:70]}")
+          PY
+
+      # ── Create test secrets JSON ────────────────────────────────────────────
+      #
+      # These are clearly-marked test values. They are never real credentials.
+      # The JSON key format matches what generate_env.py's resolve_secret() expects:
+      #   {group}.{field}_{env}  or  {group}.{field}  (no env suffix = all envs)
+
+      - name: Create test secrets JSON
+        run: |
+          mkdir -p /tmp/envgen_out
+          cat > /tmp/secrets_test.json << 'JSON_EOF'
+          {
+            "database.password_dev":     "TEST_DEV_DB_PASS_NOT_REAL",
+            "database.password_staging": "TEST_STG_DB_PASS_NOT_REAL",
+            "database.password_prod":    "TEST_PRD_DB_PASS_NOT_REAL",
+            "redis.password_dev":        "",
+            "redis.password_staging":    "TEST_REDIS_STG_PASS_NOT_REAL",
+            "redis.password_prod":       "TEST_REDIS_PRD_PASS_NOT_REAL",
+            "auth.jwt_secret_dev":       "test_jwt_dev_secret_padded_to_32_chars_minimum",
+            "auth.jwt_secret_staging":   "test_jwt_stg_secret_padded_to_32_chars_minimum",
+            "auth.jwt_secret_prod":      "test_jwt_prd_secret_padded_to_32_chars_minimum",
+            "services.stripe_key_dev":   "sk_test_TEST_KEY_NOT_REAL",
+            "services.stripe_key_prod":  "sk_live_TEST_KEY_NOT_REAL",
+            "services.sendgrid_key":     "SG.TEST_KEY_NOT_REAL",
+            "services.sentry_dsn":       "https://test_key@sentry.io/9999999"
+          }
+          JSON_EOF
+          
+          echo "Test secrets JSON:"
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/secrets_test.json'))
+          for k in sorted(d.keys()):
+              print(f'  {k} = ***')
+          print(f'Total: {len(d)} keys')
+          "
+
+      # ── Dry-run validation ──────────────────────────────────────────────────
+
+      - name: Dry run — verify no files are written
+        run: |
+          DEV_FILE="/tmp/envgen_out/.env.dev"
+          rm -f "$DEV_FILE"
+          
+          TARGET_ENV=dev DRY_RUN=true \
+          MASTER_TEMPLATE="$MASTER_TEMPLATE" \
+          SECRETS_JSON=/tmp/secrets_test.json \
+          OUTPUT_DIR=/tmp/envgen_out \
+          python3 scripts/generate_env.py
+          
+          if [ -f "$DEV_FILE" ]; then
+            echo "FAIL: dry run created a file — it should not write anything."
+            exit 1
+          fi
+          echo "✓ Dry run correctly produced no output files."
+
+      # ── Full generation ─────────────────────────────────────────────────────
+
+      - name: Generate .env.dev
+        run: |
+          TARGET_ENV=dev DRY_RUN=false \
+          MASTER_TEMPLATE="$MASTER_TEMPLATE" \
+          SECRETS_JSON=/tmp/secrets_test.json \
+          OUTPUT_DIR=/tmp/envgen_out \
+          python3 scripts/generate_env.py
+
+      - name: Generate .env.staging
+        run: |
+          TARGET_ENV=staging DRY_RUN=false \
+          MASTER_TEMPLATE="$MASTER_TEMPLATE" \
+          SECRETS_JSON=/tmp/secrets_test.json \
+          OUTPUT_DIR=/tmp/envgen_out \
+          python3 scripts/generate_env.py
+
+      - name: Generate .env.prod
+        run: |
+          TARGET_ENV=prod DRY_RUN=false \
+          MASTER_TEMPLATE="$MASTER_TEMPLATE" \
+          SECRETS_JSON=/tmp/secrets_test.json \
+          OUTPUT_DIR=/tmp/envgen_out \
+          python3 scripts/generate_env.py
+
+      # ── Validate generated files ────────────────────────────────────────────
+
+      - name: Validate all .env files
+        run: |
+          set -euo pipefail
+          PASS=0
+          FAIL=0
+          
+          ok()   { echo "    ✓ $1"; ((PASS++)) || true; }
+          fail() { echo "    ✗ $1"; ((FAIL++)) || true; }
+          
+          check_present() {
+            local file="$1" key="$2"
+            grep -q "^${key}=" "$file" && ok "${key} present" || fail "${key} MISSING"
+          }
+          
+          check_value() {
+            local file="$1" key="$2" expected="$3"
+            local actual
+            actual="$(grep "^${key}=" "$file" | cut -d= -f2-)"
+            [ "$actual" = "$expected" ] \
+              && ok "${key}=${actual}" \
+              || fail "${key}: expected='${expected}' got='${actual}'"
+          }
+          
+          check_not_placeholder() {
+            local file="$1" key="$2"
+            if grep -q "^${key}=INJECT_FROM_SECRETS$" "$file"; then
+              fail "${key} still has INJECT_FROM_SECRETS placeholder"
+            else
+              ok "${key} has injected value"
+            fi
+          }
+          
+          check_not_empty() {
+            local file="$1" key="$2"
+            local val
+            val="$(grep "^${key}=" "$file" 2>/dev/null | cut -d= -f2-)"
+            [ -n "$val" ] \
+              && ok "${key} is non-empty" \
+              || fail "${key} is empty or missing"
+          }
+          
+          for ENV in dev staging prod; do
+            FILE="/tmp/envgen_out/.env.${ENV}"
+            echo ""
+            echo "  ── .env.${ENV} ──────────────────────────────────────"
+            
+            # File existence
+            if [ ! -f "$FILE" ]; then
+              fail "FILE MISSING: $FILE"
+              continue
+            fi
+            if [ ! -s "$FILE" ]; then
+              fail "FILE IS EMPTY: $FILE"
+              continue
+            fi
+            ok "file exists and is non-empty"
+            
+            # Required keys present across all envs
+            for KEY in APP_NAME APP_PORT APP_URL APP_LOG_LEVEL APP_DEBUG \
+                       DATABASE_HOST DATABASE_PORT DATABASE_NAME DATABASE_USER \
+                       DATABASE_PASSWORD DATABASE_SSL DATABASE_POOL_MAX \
+                       REDIS_HOST REDIS_PORT REDIS_DB REDIS_TLS REDIS_PASSWORD \
+                       AUTH_JWT_SECRET AUTH_JWT_EXPIRY_SECS \
+                       AUTH_SESSION_NAME AUTH_SESSION_SECURE \
+                       FEATURE_FLAGS_NEW_UI FEATURE_FLAGS_BETA \
+                       FEATURE_FLAGS_EMAIL FEATURE_FLAGS_RATE_LIMIT; do
+              check_present "$FILE" "$KEY"
+            done
+            
+            # Secrets were injected — no placeholder remaining
+            for KEY in DATABASE_PASSWORD AUTH_JWT_SECRET \
+                       SERVICES_STRIPE_KEY SERVICES_SENDGRID_KEY SERVICES_SENTRY_DSN; do
+              check_not_placeholder "$FILE" "$KEY"
+            done
+            
+            # Environment-specific values from the master template QuickFuncs
+            if [ "$ENV" = "dev" ]; then
+              check_value "$FILE" "APP_PORT"          "3000"
+              check_value "$FILE" "DATABASE_HOST"     "localhost"
+              check_value "$FILE" "DATABASE_NAME"     "myapp_dev"
+              check_value "$FILE" "DATABASE_USER"     "postgres"
+              check_value "$FILE" "DATABASE_PORT"     "5432"
+              check_value "$FILE" "DATABASE_SSL"      "false"
+              check_value "$FILE" "DATABASE_POOL_MAX" "5"
+              check_value "$FILE" "REDIS_HOST"        "localhost"
+              check_value "$FILE" "REDIS_TLS"         "false"
+              check_value "$FILE" "APP_DEBUG"         "true"
+              check_value "$FILE" "APP_LOG_LEVEL"     "debug"
+              check_value "$FILE" "AUTH_JWT_EXPIRY_SECS" "86400"
+              check_value "$FILE" "AUTH_SESSION_SECURE"  "false"
+              check_value "$FILE" "FEATURE_FLAGS_BETA"   "true"
+              check_value "$FILE" "FEATURE_FLAGS_RATE_LIMIT" "false"
+            elif [ "$ENV" = "staging" ]; then
+              check_value "$FILE" "APP_PORT"          "8080"
+              check_value "$FILE" "DATABASE_HOST"     "db.staging.internal"
+              check_value "$FILE" "DATABASE_NAME"     "myapp_staging"
+              check_value "$FILE" "DATABASE_POOL_MAX" "10"
+              check_value "$FILE" "REDIS_HOST"        "redis.staging.internal"
+              check_value "$FILE" "REDIS_TLS"         "true"
+              check_value "$FILE" "APP_DEBUG"         "false"
+              check_value "$FILE" "APP_LOG_LEVEL"     "info"
+              check_value "$FILE" "AUTH_JWT_EXPIRY_SECS" "7200"
+              check_value "$FILE" "AUTH_SESSION_SECURE"  "true"
+              check_value "$FILE" "FEATURE_FLAGS_NEW_UI" "true"
+              check_value "$FILE" "FEATURE_FLAGS_RATE_LIMIT" "true"
+            elif [ "$ENV" = "prod" ]; then
+              check_value "$FILE" "APP_PORT"          "8080"
+              check_value "$FILE" "DATABASE_HOST"     "db.prod.internal"
+              check_value "$FILE" "DATABASE_NAME"     "myapp_prod"
+              check_value "$FILE" "DATABASE_USER"     "app"
+              check_value "$FILE" "DATABASE_SSL"      "true"
+              check_value "$FILE" "DATABASE_POOL_MAX" "20"
+              check_value "$FILE" "REDIS_HOST"        "redis.prod.internal"
+              check_value "$FILE" "REDIS_TLS"         "true"
+              check_value "$FILE" "APP_DEBUG"         "false"
+              check_value "$FILE" "APP_LOG_LEVEL"     "warn"
+              check_value "$FILE" "AUTH_JWT_EXPIRY_SECS" "3600"
+              check_value "$FILE" "AUTH_SESSION_SECURE"  "true"
+              check_value "$FILE" "FEATURE_FLAGS_NEW_UI"    "false"
+              check_value "$FILE" "FEATURE_FLAGS_EMAIL"      "true"
+              check_value "$FILE" "FEATURE_FLAGS_RATE_LIMIT" "true"
+              check_value "$FILE" "FEATURE_FLAGS_BETA"       "false"
+            fi
+          done
+          
+          echo ""
+          echo "  ────────────────────────────────────────────────────"
+          echo "  PASSED: ${PASS}   FAILED: ${FAIL}"
+          echo "  ────────────────────────────────────────────────────"
+          
+          [ "$FAIL" -eq 0 ] || exit 1
+
+      - name: Show generated files (always)
+        if: always()
+        run: |
+          for ENV in dev staging prod; do
+            FILE="/tmp/envgen_out/.env.${ENV}"
+            if [ -f "$FILE" ]; then
+              echo ""
+              echo "══════════════════ .env.${ENV} ══════════════════"
+              # Mask injected secret values in output
+              sed -E \
+                -e 's/(DATABASE_PASSWORD=).*/\1***/' \
+                -e 's/(AUTH_JWT_SECRET=).*/\1***/' \
+                -e 's/(SERVICES_STRIPE_KEY=).*/\1***/' \
+                -e 's/(SERVICES_SENDGRID_KEY=).*/\1***/' \
+                -e 's/(SERVICES_SENTRY_DSN=).*/\1***/' \
+                -e 's/(REDIS_PASSWORD=).+/\1***/' \
+                "$FILE"
+            fi
+          done
+
+      - name: Upload .env artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: envgen-test-output-${{ github.run_number }}
+          path: /tmp/envgen_out/
+          retention-days: 7
+
+  # ── Job 2: Full encrypt/decrypt pipeline test (workflow_dispatch only) ───────
+  #
+  # Tests the complete chain:
+  #   Write .mdix secrets file → mdix compile (encrypt) → mdix decrypt →
+  #   mdix convert to JSON → generate_env.py → validate output
+  #
+  # Requires MDIX_ENV_TEST_PASSWORD to be set as a repository secret.
+  # Add it at: Settings → Secrets and variables → Actions → New secret
+
+  test-encrypted:
+    name: Full encrypt/decrypt pipeline
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Only run on manual dispatch — encrypted test is not triggered by pushes
+    if: github.event_name == 'workflow_dispatch' && inputs.run_encrypted_test == 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check MDIX_ENV_TEST_PASSWORD availability
+        id: check-secret
+        env:
+          TEST_PWD: ${{ secrets.MDIX_ENV_TEST_PASSWORD }}
+        run: |
+          if [ -n "$TEST_PWD" ]; then
+            echo "available=true"  >> "$GITHUB_OUTPUT"
+            echo "✓ MDIX_ENV_TEST_PASSWORD is set — running full pipeline test."
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "⚠ MDIX_ENV_TEST_PASSWORD is NOT set."
+            echo "  Add it at: Settings → Secrets and variables → Actions → New secret"
+            echo "  Skipping encrypted pipeline test."
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.check-secret.outputs.available == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Get weekly cache key
+        if: steps.check-secret.outputs.available == 'true'
+        id: week
+        run: echo "key=$(date -u '+%Y-%U')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache mdix binary
+        if: steps.check-secret.outputs.available == 'true'
+        id: cache-mdix
+        uses: actions/cache@v4
+        with:
+          path: ~/.mdix-bin
+          key: mdix-cli-${{ runner.os }}-${{ steps.week.outputs.key }}
+          restore-keys: mdix-cli-${{ runner.os }}-
+
+      - name: Build mdix (cache miss)
+        if: steps.check-secret.outputs.available == 'true' && steps.cache-mdix.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/Mid-D-Man/DixScript-Rust.git /tmp/dixscript
+          cd /tmp/dixscript
+          cargo build -p mdix-cli --release
+          mkdir -p ~/.mdix-bin
+          cp target/release/mdix ~/.mdix-bin/mdix
+
+      - name: Install mdix
+        if: steps.check-secret.outputs.available == 'true'
+        run: sudo cp ~/.mdix-bin/mdix /usr/local/bin/mdix
+
+      - name: Write and compile test secrets
+        if: steps.check-secret.outputs.available == 'true'
+        env:
+          MDIX_DLM_PASSWORD: ${{ secrets.MDIX_ENV_TEST_PASSWORD }}
+        run: |
+          mkdir -p /tmp/enc_test/out /tmp/enc_test/decrypted
+          
+          # Write minimal test secrets .mdix matching the structure env.secrets.mdix expects
+          cat > /tmp/enc_test/env.secrets.mdix << 'MDIX_EOF'
+          @CONFIG(
+            version  -> "1.0.0"
+            features -> "data"
+          )
+          @DLM(DEncryptor.aes256)
+          @DATA(
+            database:
+              password_dev     = "ENC_PIPELINE_DEV_DB_PASS"
+              password_staging = "ENC_PIPELINE_STG_DB_PASS"
+              password_prod    = "ENC_PIPELINE_PRD_DB_PASS"
+            redis:
+              password_dev     = ""
+              password_staging = "ENC_PIPELINE_REDIS_STG"
+              password_prod    = "ENC_PIPELINE_REDIS_PRD"
+            auth:
+              jwt_secret_dev     = "enc_pipeline_jwt_dev_32_chars_padded_aaaa"
+              jwt_secret_staging = "enc_pipeline_jwt_stg_32_chars_padded_aaaa"
+              jwt_secret_prod    = "enc_pipeline_jwt_prd_32_chars_padded_aaaa"
+            services:
+              stripe_key_dev  = "sk_test_ENC_PIPELINE_NOTREAL"
+              stripe_key_prod = "sk_live_ENC_PIPELINE_NOTREAL"
+              sendgrid_key    = "SG.ENC_PIPELINE_NOTREAL"
+              sentry_dsn      = "https://enc_pipeline@sentry.io/1"
+          )
+          @SECURITY(
+            encryption -> { mode = "password", algorithm = "aes256-gcm" }
+          )
+          MDIX_EOF
+          
+          echo "Compiling secrets file (encrypting)..."
+          mdix compile /tmp/enc_test/env.secrets.mdix -o /tmp/enc_test/out/
+          echo ""
+          echo "Files produced:"
+          ls -la /tmp/enc_test/out/
+
+      - name: Decrypt test secrets
+        if: steps.check-secret.outputs.available == 'true'
+        env:
+          MDIX_DLM_PASSWORD: ${{ secrets.MDIX_ENV_TEST_PASSWORD }}
+        run: |
+          ENC_FILE="/tmp/enc_test/out/env.secrets.mdix.enc"
+          
+          echo "Decrypting..."
+          mdix decrypt "$ENC_FILE" \
+            --password \
+            -o /tmp/enc_test/decrypted/
+          
+          echo "Converting decrypted file to JSON..."
+          mdix convert /tmp/enc_test/decrypted/env.secrets.mdix \
+            --to json \
+            -o /tmp/enc_test/secrets.json
+          
+          echo ""
+          echo "Secrets JSON keys (values masked):"
+          python3 - << 'PY'
+          import json, re
+          d = json.load(open('/tmp/enc_test/secrets.json'))
+          sensitive = re.compile(r'(password|secret|key|token|dsn)', re.I)
+          for k in sorted(d.keys()):
+              v = '***' if sensitive.search(k) else str(d[k])[:40]
+              print(f'  {k} = {v}')
+          print(f'Total: {len(d)} keys')
+          PY
+
+      - name: Generate .env.dev from encrypted secrets
+        if: steps.check-secret.outputs.available == 'true'
+        run: |
+          TARGET_ENV=dev DRY_RUN=false \
+          MASTER_TEMPLATE="$MASTER_TEMPLATE" \
+          SECRETS_JSON=/tmp/enc_test/secrets.json \
+          OUTPUT_DIR=/tmp/enc_test/envout \
+          python3 scripts/generate_env.py
+
+      - name: Validate secrets were injected from encrypted source
+        if: steps.check-secret.outputs.available == 'true'
+        run: |
+          FILE="/tmp/enc_test/envout/.env.dev"
+          echo "Checking that secrets came from the encrypted file..."
+          
+          FAIL=0
+          for KEY in DATABASE_PASSWORD AUTH_JWT_SECRET SERVICES_STRIPE_KEY; do
+            VAL="$(grep "^${KEY}=" "$FILE" | cut -d= -f2-)"
+            if [ "$VAL" = "INJECT_FROM_SECRETS" ]; then
+              echo "✗ ${KEY}: still has INJECT_FROM_SECRETS — injection failed"
+              ((FAIL++)) || true
+            elif [ -z "$VAL" ]; then
+              echo "✗ ${KEY}: is empty after injection"
+              ((FAIL++)) || true
+            else
+              echo "✓ ${KEY}: injected from encrypted source"
+            fi
+          done
+          
+          # Verify a specific known value (DATABASE_PASSWORD for dev)
+          DB_PASS="$(grep "^DATABASE_PASSWORD=" "$FILE" | cut -d= -f2-)"
+          if [ "$DB_PASS" = "ENC_PIPELINE_DEV_DB_PASS" ]; then
+            echo "✓ DATABASE_PASSWORD matches value from encrypted file"
+          else
+            echo "✗ DATABASE_PASSWORD value mismatch: got '${DB_PASS}'"
+            ((FAIL++)) || true
+          fi
+          
+          echo ""
+          [ "$FAIL" -eq 0 ] && echo "✓ Full encrypted pipeline test passed." || { echo "✗ ${FAIL} checks failed."; exit 1; }
+
+      - name: Upload encrypted pipeline artifacts
+        if: always() && steps.check-secret.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: envgen-encrypted-test-${{ github.run_number }}
+          path: /tmp/enc_test/envout/
+          retention-days: 7
