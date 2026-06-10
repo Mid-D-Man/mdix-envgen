@@ -96,20 +96,34 @@ def patch_and_compile(master_template, target_env):
     with open(master_template) as fh:
         source = fh.read()
 
-    patched = re.sub(
+    # Use re.subn so we count actual match occurrences independently of
+    # whether the replacement string happened to equal the original.
+    #
+    # The old guard `if patched == source` was a false-negative whenever
+    # TARGET_ENV matched the value already in the file (e.g. TARGET_ENV=dev
+    # with the template already containing Env.DEV).  The substitution is a
+    # no-op in that case, patched == source is True, and the script wrongly
+    # exited 1 with "could not find line to patch".
+    patched, n_subs = re.subn(
         r"(current_env<enum>\s*=\s*)Env\.\w+",
         rf"\g<1>{enum_value}",
         source,
+        count=1,
     )
 
-    if patched == source:
+    if n_subs == 0:
         print(
-            "WARNING: could not find 'current_env<enum>' line to patch",
+            "WARNING: could not find 'current_env<enum>' line to patch — "
+            "check that the master template contains the expected switch line",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    print(f"Patched  : current_env<enum> = {enum_value}")
+    changed = patched != source
+    print(
+        f"Patched  : current_env<enum> = {enum_value}"
+        f"{'  (value unchanged)' if not changed else ''}"
+    )
 
     patched_path = f"/tmp/env.{target_env}.mdix"
     json_path    = f"/tmp/env.{target_env}.json"
@@ -168,8 +182,11 @@ def generate_dotenv(config, secrets, target_env, output_dir, dry_run):
         "services.sentry_dsn":   resolve_secret(secrets, "services", "sentry_dsn",  target_env),
     }
 
+    # Inject when a secret value was found (including empty string — an empty
+    # secret is intentional, e.g. no Redis password in dev; it should be
+    # written as KEY= rather than left as KEY=INJECT_FROM_SECRETS).
     for dotted_key, secret_value in injections.items():
-        if secret_value and config.get(dotted_key) == PLACEHOLDER:
+        if secret_value is not None and config.get(dotted_key) == PLACEHOLDER:
             config[dotted_key] = secret_value
 
     # Keys to exclude from the .env output (meta fields, not runtime config)
