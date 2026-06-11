@@ -110,25 +110,31 @@ jobs:
       # These are clearly-marked test values. They are never real credentials.
       # The JSON key format matches what generate_env.py's resolve_secret() expects:
       #   {group}.{field}_{env}  or  {group}.{field}  (no env suffix = all envs)
+      #
+      # stripe_key_staging is listed explicitly because there is no generic
+      # services.stripe_key fallback — only _dev and _prod variants exist in the
+      # secrets template.  Without it, staging injection would be skipped and
+      # SERVICES_STRIPE_KEY would remain INJECT_FROM_SECRETS.
 
       - name: Create test secrets JSON
         run: |
           mkdir -p /tmp/envgen_out
           cat > /tmp/secrets_test.json << 'JSON_EOF'
           {
-            "database.password_dev":     "TEST_DEV_DB_PASS_NOT_REAL",
-            "database.password_staging": "TEST_STG_DB_PASS_NOT_REAL",
-            "database.password_prod":    "TEST_PRD_DB_PASS_NOT_REAL",
-            "redis.password_dev":        "",
-            "redis.password_staging":    "TEST_REDIS_STG_PASS_NOT_REAL",
-            "redis.password_prod":       "TEST_REDIS_PRD_PASS_NOT_REAL",
-            "auth.jwt_secret_dev":       "test_jwt_dev_secret_padded_to_32_chars_minimum",
-            "auth.jwt_secret_staging":   "test_jwt_stg_secret_padded_to_32_chars_minimum",
-            "auth.jwt_secret_prod":      "test_jwt_prd_secret_padded_to_32_chars_minimum",
-            "services.stripe_key_dev":   "sk_test_TEST_KEY_NOT_REAL",
-            "services.stripe_key_prod":  "sk_live_TEST_KEY_NOT_REAL",
-            "services.sendgrid_key":     "SG.TEST_KEY_NOT_REAL",
-            "services.sentry_dsn":       "https://test_key@sentry.io/9999999"
+            "database.password_dev":      "TEST_DEV_DB_PASS_NOT_REAL",
+            "database.password_staging":  "TEST_STG_DB_PASS_NOT_REAL",
+            "database.password_prod":     "TEST_PRD_DB_PASS_NOT_REAL",
+            "redis.password_dev":         "",
+            "redis.password_staging":     "TEST_REDIS_STG_PASS_NOT_REAL",
+            "redis.password_prod":        "TEST_REDIS_PRD_PASS_NOT_REAL",
+            "auth.jwt_secret_dev":        "test_jwt_dev_secret_padded_to_32_chars_minimum",
+            "auth.jwt_secret_staging":    "test_jwt_stg_secret_padded_to_32_chars_minimum",
+            "auth.jwt_secret_prod":       "test_jwt_prd_secret_padded_to_32_chars_minimum",
+            "services.stripe_key_dev":    "sk_test_TEST_KEY_NOT_REAL",
+            "services.stripe_key_staging":"sk_test_TEST_KEY_NOT_REAL",
+            "services.stripe_key_prod":   "sk_live_TEST_KEY_NOT_REAL",
+            "services.sendgrid_key":      "SG.TEST_KEY_NOT_REAL",
+            "services.sentry_dsn":        "https://test_key@sentry.io/9999999"
           }
           JSON_EOF
 
@@ -265,51 +271,51 @@ jobs:
 
             # Environment-specific values from the master template QuickFuncs
             if [ "$ENV" = "dev" ]; then
-              check_value "$FILE" "APP_PORT"          "3000"
-              check_value "$FILE" "DATABASE_HOST"     "localhost"
-              check_value "$FILE" "DATABASE_NAME"     "myapp_dev"
-              check_value "$FILE" "DATABASE_USER"     "postgres"
-              check_value "$FILE" "DATABASE_PORT"     "5432"
-              check_value "$FILE" "DATABASE_SSL"      "false"
-              check_value "$FILE" "DATABASE_POOL_MAX" "5"
-              check_value "$FILE" "REDIS_HOST"        "localhost"
-              check_value "$FILE" "REDIS_TLS"         "false"
-              check_value "$FILE" "APP_DEBUG"         "true"
-              check_value "$FILE" "APP_LOG_LEVEL"     "debug"
-              check_value "$FILE" "AUTH_JWT_EXPIRY_SECS"    "86400"
-              check_value "$FILE" "AUTH_SESSION_SECURE"     "false"
-              check_value "$FILE" "FEATURE_FLAGS_BETA"      "true"
+              check_value "$FILE" "APP_PORT"               "3000"
+              check_value "$FILE" "DATABASE_HOST"          "localhost"
+              check_value "$FILE" "DATABASE_NAME"          "myapp_dev"
+              check_value "$FILE" "DATABASE_USER"          "postgres"
+              check_value "$FILE" "DATABASE_PORT"          "5432"
+              check_value "$FILE" "DATABASE_SSL"           "false"
+              check_value "$FILE" "DATABASE_POOL_MAX"      "5"
+              check_value "$FILE" "REDIS_HOST"             "localhost"
+              check_value "$FILE" "REDIS_TLS"              "false"
+              check_value "$FILE" "APP_DEBUG"              "true"
+              check_value "$FILE" "APP_LOG_LEVEL"          "debug"
+              check_value "$FILE" "AUTH_JWT_EXPIRY_SECS"   "86400"
+              check_value "$FILE" "AUTH_SESSION_SECURE"    "false"
+              check_value "$FILE" "FEATURE_FLAGS_BETA"     "true"
               check_value "$FILE" "FEATURE_FLAGS_RATE_LIMIT" "false"
             elif [ "$ENV" = "staging" ]; then
-              check_value "$FILE" "APP_PORT"          "8080"
-              check_value "$FILE" "DATABASE_HOST"     "db.staging.internal"
-              check_value "$FILE" "DATABASE_NAME"     "myapp_staging"
-              check_value "$FILE" "DATABASE_POOL_MAX" "10"
-              check_value "$FILE" "REDIS_HOST"        "redis.staging.internal"
-              check_value "$FILE" "REDIS_TLS"         "true"
-              check_value "$FILE" "APP_DEBUG"         "false"
-              check_value "$FILE" "APP_LOG_LEVEL"     "info"
-              check_value "$FILE" "AUTH_JWT_EXPIRY_SECS"    "7200"
-              check_value "$FILE" "AUTH_SESSION_SECURE"     "true"
-              check_value "$FILE" "FEATURE_FLAGS_NEW_UI"    "true"
+              check_value "$FILE" "APP_PORT"               "8080"
+              check_value "$FILE" "DATABASE_HOST"          "db.staging.internal"
+              check_value "$FILE" "DATABASE_NAME"          "myapp_staging"
+              check_value "$FILE" "DATABASE_POOL_MAX"      "10"
+              check_value "$FILE" "REDIS_HOST"             "redis.staging.internal"
+              check_value "$FILE" "REDIS_TLS"              "true"
+              check_value "$FILE" "APP_DEBUG"              "false"
+              check_value "$FILE" "APP_LOG_LEVEL"          "info"
+              check_value "$FILE" "AUTH_JWT_EXPIRY_SECS"   "7200"
+              check_value "$FILE" "AUTH_SESSION_SECURE"    "true"
+              check_value "$FILE" "FEATURE_FLAGS_NEW_UI"   "true"
               check_value "$FILE" "FEATURE_FLAGS_RATE_LIMIT" "true"
             elif [ "$ENV" = "prod" ]; then
-              check_value "$FILE" "APP_PORT"          "8080"
-              check_value "$FILE" "DATABASE_HOST"     "db.prod.internal"
-              check_value "$FILE" "DATABASE_NAME"     "myapp_prod"
-              check_value "$FILE" "DATABASE_USER"     "app"
-              check_value "$FILE" "DATABASE_SSL"      "true"
-              check_value "$FILE" "DATABASE_POOL_MAX" "20"
-              check_value "$FILE" "REDIS_HOST"        "redis.prod.internal"
-              check_value "$FILE" "REDIS_TLS"         "true"
-              check_value "$FILE" "APP_DEBUG"         "false"
-              check_value "$FILE" "APP_LOG_LEVEL"     "warn"
-              check_value "$FILE" "AUTH_JWT_EXPIRY_SECS"    "3600"
-              check_value "$FILE" "AUTH_SESSION_SECURE"     "true"
-              check_value "$FILE" "FEATURE_FLAGS_NEW_UI"    "false"
-              check_value "$FILE" "FEATURE_FLAGS_EMAIL"      "true"
+              check_value "$FILE" "APP_PORT"               "8080"
+              check_value "$FILE" "DATABASE_HOST"          "db.prod.internal"
+              check_value "$FILE" "DATABASE_NAME"          "myapp_prod"
+              check_value "$FILE" "DATABASE_USER"          "app"
+              check_value "$FILE" "DATABASE_SSL"           "true"
+              check_value "$FILE" "DATABASE_POOL_MAX"      "20"
+              check_value "$FILE" "REDIS_HOST"             "redis.prod.internal"
+              check_value "$FILE" "REDIS_TLS"              "true"
+              check_value "$FILE" "APP_DEBUG"              "false"
+              check_value "$FILE" "APP_LOG_LEVEL"          "warn"
+              check_value "$FILE" "AUTH_JWT_EXPIRY_SECS"   "3600"
+              check_value "$FILE" "AUTH_SESSION_SECURE"    "true"
+              check_value "$FILE" "FEATURE_FLAGS_NEW_UI"   "false"
+              check_value "$FILE" "FEATURE_FLAGS_EMAIL"    "true"
               check_value "$FILE" "FEATURE_FLAGS_RATE_LIMIT" "true"
-              check_value "$FILE" "FEATURE_FLAGS_BETA"       "false"
+              check_value "$FILE" "FEATURE_FLAGS_BETA"     "false"
             fi
           done
 
@@ -422,12 +428,12 @@ jobs:
         run: |
           mkdir -p /tmp/enc_test/out /tmp/enc_test/decrypted
 
-          # Write minimal test secrets .mdix matching the structure
-          # env.secrets.mdix expects.
+          # NOTE: `features -> "advanced"` is intentionally absent — that
+          # feature set excludes @DLM.  The default (no features directive)
+          # permits all sections including @DLM.
           #
-          # NOTE: `features -> "advanced"` is intentionally absent from @CONFIG.
-          # That feature set excludes the DLM pipeline; the default (no features
-          # directive) permits all sections including @DLM.
+          # stripe_key_staging is included so all three environments can
+          # inject SERVICES_STRIPE_KEY without falling back to a missing key.
           cat > /tmp/enc_test/env.secrets.mdix << 'MDIX_EOF'
           @CONFIG(
             version  -> "1.0.0"
@@ -449,10 +455,11 @@ jobs:
               jwt_secret_staging = "enc_pipeline_jwt_stg_32_chars_padded_aaaa"
               jwt_secret_prod    = "enc_pipeline_jwt_prd_32_chars_padded_aaaa"
             services:
-              stripe_key_dev  = "sk_test_ENC_PIPELINE_NOTREAL"
-              stripe_key_prod = "sk_live_ENC_PIPELINE_NOTREAL"
-              sendgrid_key    = "SG.ENC_PIPELINE_NOTREAL"
-              sentry_dsn      = "https://enc_pipeline@sentry.io/1"
+              stripe_key_dev     = "sk_test_ENC_PIPELINE_NOTREAL"
+              stripe_key_staging = "sk_test_ENC_PIPELINE_NOTREAL"
+              stripe_key_prod    = "sk_live_ENC_PIPELINE_NOTREAL"
+              sendgrid_key       = "SG.ENC_PIPELINE_NOTREAL"
+              sentry_dsn         = "https://enc_pipeline@sentry.io/1"
           )
           @SECURITY(
             encryption -> { mode = "password", algorithm = "aes256-gcm" }
@@ -474,7 +481,7 @@ jobs:
 
           echo "Decrypting..."
           mdix decrypt "$ENC_FILE" \
-            --password \
+            --password "$MDIX_DLM_PASSWORD" \
             -o /tmp/enc_test/decrypted/
 
           echo "Converting decrypted file to JSON..."
