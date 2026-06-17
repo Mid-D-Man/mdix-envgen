@@ -11,6 +11,17 @@ Usage (local):
 
 Usage (from GitHub Actions — env vars are set by the workflow):
   python3 scripts/generate_env.py
+
+Secrets resolution:
+  Each INJECT_FROM_SECRETS field is resolved in this order:
+    1. secrets["{group}.{field}_{env}"]  — from the decrypted secrets JSON
+    2. secrets["{group}.{field}"]        — from the decrypted secrets JSON
+    3. os.environ["GROUP_FIELD_ENV"]     — e.g. DATABASE_PASSWORD_DEV
+    4. os.environ["GROUP_FIELD"]         — e.g. SERVICES_STRIPE_KEY
+  So a secret can come from a decrypted .mdix.enc bundle, from a plain
+  GitHub Actions secret passed straight through as an env var with no
+  encryption step at all, or a mix of both — the JSON bundle always wins
+  when a field exists in both places.
 """
 
 import argparse
@@ -48,7 +59,9 @@ def parse_args():
     p.add_argument(
         "--secrets-json",
         default=os.environ.get("SECRETS_JSON", "/tmp/secrets.json"),
-        help="Path to decrypted secrets JSON (or {} if none)",
+        help="Path to decrypted secrets JSON (or {} if none). Fields not "
+             "found here fall back to matching environment variables — "
+             "see the module docstring.",
     )
     p.add_argument(
         "--output-dir",
@@ -159,12 +172,29 @@ def patch_and_compile(master_template, target_env):
 
 def resolve_secret(secrets, group, field, env):
     """
-    Look for secrets['group.field_env'] first,
-    then fall back to secrets['group.field'].
+    Resolve a secret value with the following priority:
+      1. secrets["{group}.{field}_{env}"]   — env-specific, decrypted JSON
+      2. secrets["{group}.{field}"]         — generic, decrypted JSON
+      3. os.environ["GROUP_FIELD_ENV"]      — env-specific, plain env var
+      4. os.environ["GROUP_FIELD"]          — generic, plain env var
+      5. None                               — field stays INJECT_FROM_SECRETS
+
+    The env-var fallback uses the exact same naming the .env writer already
+    produces (dots → underscores, upper-cased), so a project can skip the
+    encrypted-bundle pipeline entirely and just pass GitHub Actions secrets
+    straight into the generate step's `env:` block — or mix both, with the
+    decrypted JSON always taking priority for any field present in it.
     """
     keyed   = secrets.get(f"{group}.{field}_{env}")
     generic = secrets.get(f"{group}.{field}")
-    return keyed if keyed is not None else generic
+    if keyed is not None:
+        return keyed
+    if generic is not None:
+        return generic
+
+    env_keyed   = os.environ.get(f"{group}_{field}_{env}".upper())
+    env_generic = os.environ.get(f"{group}_{field}".upper())
+    return env_keyed if env_keyed is not None else env_generic
 
 
 def generate_dotenv(config, secrets, target_env, output_dir, dry_run):
@@ -254,7 +284,10 @@ def generate_dotenv(config, secrets, target_env, output_dir, dry_run):
 def run(args):
     config = patch_and_compile(args.master_template, args.env)
 
-    # Load decrypted secrets (written by the workflow's decrypt step)
+    # Load decrypted secrets (written by the workflow's decrypt step).
+    # This is just one of two secret sources now — see resolve_secret().
+    # Its absence isn't fatal: env-var-sourced secrets still resolve, and
+    # anything covered by neither source simply stays as the placeholder.
     secrets = {}
     if os.path.exists(args.secrets_json):
         with open(args.secrets_json) as fh:
@@ -266,7 +299,11 @@ def run(args):
                     file=sys.stderr,
                 )
     else:
-        print("No secrets JSON found — INJECT_FROM_SECRETS fields will remain as placeholders.")
+        print(
+            "No secrets JSON found — INJECT_FROM_SECRETS fields will be "
+            "resolved from matching environment variables if set, "
+            "otherwise remain as placeholders."
+        )
 
     generate_dotenv(config, secrets, args.env, args.output_dir, args.dry_run)
 
