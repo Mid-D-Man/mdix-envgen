@@ -76,6 +76,11 @@ jobs:
           fi
 
       - name: Generate .env file
+        # INJECT_FROM_SECRETS fields can also be resolved straight from env
+        # vars here (GROUP_FIELD or GROUP_FIELD_ENV, e.g. DATABASE_PASSWORD_PROD)
+        # with no encrypted bundle involved at all — add them to the env:
+        # block below. See resolve_secret() in scripts/generate_env.py and
+        # the README's "Alternative: plain GitHub Actions secrets" section.
         env:
           TARGET_ENV:      ${{ inputs.environment || 'dev' }}
           DRY_RUN:         ${{ inputs.dry_run || 'false' }}
